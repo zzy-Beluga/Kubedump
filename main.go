@@ -220,22 +220,33 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 // TO DO: find a way to get pod rx and tx traffic metrics
 
 func getServiceBytesReceived(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service) (float64, error) {
-	Endpoints, error := clientset.CoreV1().Endpoints(service.Namespace).Get(context.Background(), service.Name, metav1.GetOptions{})
-	if error != nil {
-		return 0, error
+	ipset := getPodsbyService(clientset, service)
+	for _, ip := range ipset {
+		fmt.Println(ip)
 	}
-
-	for _, subset := range Endpoints.Subsets {
-		for _, Addresses := range subset.Addresses {
-			fmt.Println(Addresses.IP)
-		}
-	}
-
 	return 1, nil
 }
 
 //==============================---Get-Service-Bytes-Transmitted---============================
 
 func getServiceBytesTransmitted(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service) (float64, error) {
+	ipset := getPodsbyService(clientset, service)
+	for _, ip := range ipset {
+		fmt.Println(ip)
+	}
 	return 1, nil
+}
+
+//===============================---utils---=================================
+
+func getPodsbyService(clientset kubernetes.Interface, service *corev1.Service) []string {
+	Endpoints, _ := clientset.CoreV1().Endpoints(service.Name).Get(context.Background(), service.Name, metav1.GetOptions{})
+	var ipset []string
+	for _, subset := range Endpoints.Subsets {
+		for _, Addresses := range subset.Addresses {
+			ipset = append(ipset, Addresses.IP)
+		}
+
+	}
+	return ipset
 }
