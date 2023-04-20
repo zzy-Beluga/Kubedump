@@ -6,7 +6,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,7 +27,7 @@ import (
 //===========================---global-var---========================
 
 var (
-	interval = time.Duration(5) * time.Second
+	interval = time.Duration(20) * time.Second
 )
 
 //==============================---main---============================
@@ -77,20 +79,70 @@ func main() {
 	)
 	serviceInformer := informerFactory.Core().V1().Services().Informer()
 
+	// Create a stop channel for each service.
+	stopChans := make(map[string]chan struct{})
+	// Create a read-write lock for the stop channels map.
+	stopChansLock := sync.RWMutex{}
+
 	// Define the event handlers.
 	serviceEventHandler := cache.ResourceEventHandlerFuncs{
 		// when a service is added, start to collect metrics for that service
 		AddFunc: func(obj interface{}) {
+
+			stopChansLock.Lock()
+			defer stopChansLock.Unlock()
+
 			service := obj.(*corev1.Service)
-			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted)
+
+			// Create a new stop channel for this service.
+			stopCh := make(chan struct{})
+
+			// Add the stop channel to the map.
+			stopChans[service.Name] = stopCh
+
+			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
 		},
 		// when a service is updated, start to collect for the service with new status
 		UpdateFunc: func(oldObj, newObj interface{}) {
+
+			stopChansLock.Lock()
+			defer stopChansLock.Unlock()
+
 			service := newObj.(*corev1.Service)
-			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted)
+
+			// Get the existing stop channel for this service.
+			stopCh, ok := stopChans[service.Name]
+			if ok {
+				// Stop the existing goroutine by closing the stop channel.
+				close(stopCh)
+			}
+
+			// Create a new stop channel for this service.
+			stopCh = make(chan struct{})
+			stopChans[service.Name] = stopCh
+
+			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
 		},
-		// the collecting function stops itself when the service can not find in clientset, so do not need action on service deletion
-		DeleteFunc: func(obj interface{}) {},
+		// delete exsiting goroutine on service deletion
+		DeleteFunc: func(obj interface{}) {
+
+			stopChansLock.Lock()
+			defer stopChansLock.Unlock()
+
+			service := obj.(*corev1.Service)
+			// Get the existing stop channel for this service.
+			stopCh, ok := stopChans[service.Name]
+			if !ok {
+				// If the stop channel doesn't exist, do nothing.
+				return
+			}
+
+			// Stop the existing goroutine by closing the stop channel.
+			close(stopCh)
+
+			// Remove the stop channel from the map.
+			delete(stopChans, service.Name)
+		},
 	}
 
 	// Register the event handlers with the informer.
@@ -111,7 +163,7 @@ func main() {
 //==============================---Collect-Service-Network-Metrics---============================
 
 // TO DO: make the function a neverstop loop, fetch and calulate metrics periodically and stop when the service does not exist anymore
-func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service, serviceBytesReceived *prometheus.GaugeVec, serviceBytesTransmitted *prometheus.GaugeVec) {
+func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service, serviceBytesReceived *prometheus.GaugeVec, serviceBytesTransmitted *prometheus.GaugeVec, stopCh <-chan struct{}) {
 
 	// Create the Prometheus labels.
 	labels := prometheus.Labels{
@@ -119,33 +171,48 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 		"service":   service.Name,
 	}
 
+	// create ticker to make collection happens every 5 seconds
+	ticker := time.NewTicker(5 * time.Second)
+
 	// Get the total number of bytes received by the service.
-	bytesReceived, err := getServiceBytesReceived(clientset, metricsClientset, service)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return
+	for {
+		select {
+		// stop collecting when service deleted
+		case <-stopCh:
+			log.Printf("Stopping Metrics collection for service %v in namespace %v", service.Name, service.Namespace)
+		default:
+			bytesReceived, err := getServiceBytesReceived(clientset, metricsClientset, service)
+			if err != nil {
+				if errors.IsNotFound(err) {
+					return
+				}
+				fmt.Printf("Error getting service bytes received for service %s/%s: %s\n", service.Namespace, service.Name, err.Error())
+				return
+			}
+
+			// Export to prometheus
+			serviceBytesReceived.With(labels).Set(bytesReceived)
+			fmt.Println(bytesReceived)
+
+			// Get the total number of bytes transmitted by the service.
+			bytesTransmitted, err := getServiceBytesTransmitted(clientset, metricsClientset, service)
+			if err != nil {
+				if errors.IsNotFound(err) {
+					return
+				}
+				fmt.Printf("Error getting service bytes transmitted for service %s/%s: %s\n", service.Namespace, service.Name, err.Error())
+				return
+			}
+
+			// Export to prometheus
+			serviceBytesTransmitted.With(labels).Set(bytesTransmitted)
+			fmt.Println(bytesTransmitted)
+
+			// Waiting for next period
+			<-ticker.C
+
 		}
-		fmt.Printf("Error getting service bytes received for service %s/%s: %s\n", service.Namespace, service.Name, err.Error())
-		return
 	}
-
-	// Export to prometheus
-	serviceBytesReceived.With(labels).Set(bytesReceived)
-	fmt.Println(bytesReceived)
-
-	// Get the total number of bytes transmitted by the service.
-	bytesTransmitted, err := getServiceBytesTransmitted(clientset, metricsClientset, service)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return
-		}
-		fmt.Printf("Error getting service bytes transmitted for service %s/%s: %s\n", service.Namespace, service.Name, err.Error())
-		return
-	}
-
-	// Eport to prometheus
-	serviceBytesTransmitted.With(labels).Set(bytesTransmitted)
-	fmt.Println(bytesTransmitted)
 }
 
 //==============================---Get-Service-Bytes-Received---============================
