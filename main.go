@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,8 +25,7 @@ import (
 //===========================---global-var---========================
 
 var (
-	namespace = os.Getenv("POD_NAMESPACE")
-	interval  = time.Duration(5) * time.Second
+	interval = time.Duration(5) * time.Second
 )
 
 //==============================---main---============================
@@ -76,7 +74,6 @@ func main() {
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(
 		clientset, //clientset used to communicate with api server
 		interval,  // resync period
-		informers.WithNamespace(namespace),
 	)
 	serviceInformer := informerFactory.Core().V1().Services().Informer()
 
