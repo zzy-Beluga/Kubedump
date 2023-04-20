@@ -21,7 +21,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 //===========================---global-var---========================
@@ -48,12 +47,6 @@ func main() {
 
 	// get clientset
 	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	//get metrics clientset for metrics collection
-	metricsClientset, err := versioned.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -100,7 +93,7 @@ func main() {
 			// Add the stop channel to the map.
 			stopChans[service.Name] = stopCh
 
-			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
+			go collectServiceNetworkMetrics(clientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
 		},
 		// when a service is updated, start to collect for the service with new status
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -121,7 +114,7 @@ func main() {
 			stopCh = make(chan struct{})
 			stopChans[service.Name] = stopCh
 
-			go collectServiceNetworkMetrics(clientset, metricsClientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
+			go collectServiceNetworkMetrics(clientset, service, serviceBytesReceived, serviceBytesTransmitted, stopCh)
 		},
 		// delete exsiting goroutine on service deletion
 		DeleteFunc: func(obj interface{}) {
@@ -156,14 +149,14 @@ func main() {
 
 	// Start the HTTP server to expose the Prometheus metrics.
 	http.Handle("/metrics", promhttp.Handler())
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":8081", nil)
 
 }
 
 //==============================---Collect-Service-Network-Metrics---============================
 
 // TO DO: make the function a neverstop loop, fetch and calulate metrics periodically and stop when the service does not exist anymore
-func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service, serviceBytesReceived *prometheus.GaugeVec, serviceBytesTransmitted *prometheus.GaugeVec, stopCh <-chan struct{}) {
+func collectServiceNetworkMetrics(clientset kubernetes.Interface, service *corev1.Service, serviceBytesReceived *prometheus.GaugeVec, serviceBytesTransmitted *prometheus.GaugeVec, stopCh <-chan struct{}) {
 
 	// Create the Prometheus labels.
 	labels := prometheus.Labels{
@@ -181,7 +174,7 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 		case <-stopCh:
 			log.Printf("Stopping Metrics collection for service %v in namespace %v", service.Name, service.Namespace)
 		default:
-			bytesReceived, err := getServiceBytesReceived(clientset, metricsClientset, service)
+			bytesReceived, err := getServiceBytesReceived(clientset, service)
 			if err != nil {
 				if errors.IsNotFound(err) {
 					return
@@ -195,7 +188,7 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 			fmt.Println(bytesReceived)
 
 			// Get the total number of bytes transmitted by the service.
-			bytesTransmitted, err := getServiceBytesTransmitted(clientset, metricsClientset, service)
+			bytesTransmitted, err := getServiceBytesTransmitted(clientset, service)
 			if err != nil {
 				if errors.IsNotFound(err) {
 					return
@@ -219,34 +212,49 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 
 // TO DO: find a way to get pod rx and tx traffic metrics
 
-func getServiceBytesReceived(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service) (float64, error) {
-	ipset := getPodsbyService(clientset, service)
-	for _, ip := range ipset {
-		fmt.Println(ip)
+func getServiceBytesReceived(clientset kubernetes.Interface, service *corev1.Service) (float64, error) {
+	ipset, err := getPodsbyService(clientset, service)
+	if err != nil {
+		return 1, err
 	}
+	fmt.Println(ipset)
 	return 1, nil
 }
 
 //==============================---Get-Service-Bytes-Transmitted---============================
 
-func getServiceBytesTransmitted(clientset kubernetes.Interface, metricsClientset versioned.Interface, service *corev1.Service) (float64, error) {
-	ipset := getPodsbyService(clientset, service)
-	for _, ip := range ipset {
-		fmt.Println(ip)
-	}
+func getServiceBytesTransmitted(clientset kubernetes.Interface, service *corev1.Service) (float64, error) {
+
 	return 1, nil
 }
 
 //===============================---utils---=================================
 
-func getPodsbyService(clientset kubernetes.Interface, service *corev1.Service) []string {
+func getPodsbyService(clientset kubernetes.Interface, service *corev1.Service) ([]corev1.Pod, error) {
 	Endpoints, _ := clientset.CoreV1().Endpoints(service.Name).Get(context.Background(), service.Name, metav1.GetOptions{})
 	var ipset []string
 	for _, subset := range Endpoints.Subsets {
 		for _, Addresses := range subset.Addresses {
 			ipset = append(ipset, Addresses.IP)
 		}
-
 	}
-	return ipset
+
+	var podLists []corev1.Pod
+
+	// get pod list
+	pods, err := clientset.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// check pod ip
+	for _, ip := range ipset {
+		for _, pod := range pods.Items {
+			if pod.Status.PodIP == ip {
+				podLists = append(podLists, pod)
+			}
+		}
+	}
+
+	return podLists, nil
 }
