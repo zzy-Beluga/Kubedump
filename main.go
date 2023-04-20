@@ -132,7 +132,7 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, metricsClients
 		return
 	}
 
-	// Eport to prometheus
+	// Export to prometheus
 	serviceBytesReceived.With(labels).Set(bytesReceived)
 	fmt.Println(bytesReceived)
 
