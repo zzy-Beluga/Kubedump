@@ -4,10 +4,13 @@ Copyright © 2023 NAME HERE <EMAIL ADDRESS>
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,6 +24,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/kubectl/pkg/scheme"
 )
 
 //===========================---global-var---========================
@@ -174,7 +179,8 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, service *corev
 		case <-stopCh:
 			log.Printf("Stopping Metrics collection for service %v in namespace %v", service.Name, service.Namespace)
 		default:
-			bytesReceived, err := getServiceBytesReceived(clientset, service)
+			cmd := "cat /proc/net/dev | awk '{if (NR>2){sum+=$2}} END {printf(\"%d\", sum)}'"
+			bytesReceived, err := getServiceBytes(clientset, service, cmd)
 			if err != nil {
 				if errors.IsNotFound(err) {
 					return
@@ -188,7 +194,8 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, service *corev
 			fmt.Println(bytesReceived)
 
 			// Get the total number of bytes transmitted by the service.
-			bytesTransmitted, err := getServiceBytesTransmitted(clientset, service)
+			cmd = "cat /proc/net/dev | awk '{if (NR>2){sum+=$10}} END {printf(\"%d\", sum)}'"
+			bytesTransmitted, err := getServiceBytes(clientset, service, cmd)
 			if err != nil {
 				if errors.IsNotFound(err) {
 					return
@@ -208,24 +215,22 @@ func collectServiceNetworkMetrics(clientset kubernetes.Interface, service *corev
 	}
 }
 
-//==============================---Get-Service-Bytes-Received---============================
+//==============================---Get-Service-Bytes---============================
 
 // TO DO: find a way to get pod rx and tx traffic metrics
 
-func getServiceBytesReceived(clientset kubernetes.Interface, service *corev1.Service) (float64, error) {
-	ipset, err := getPodsbyService(clientset, service)
+func getServiceBytes(clientset kubernetes.Interface, service *corev1.Service, cmd string) (float64, error) {
+	pods, err := getPodsbyService(clientset, service)
 	if err != nil {
-		return 1, err
+		return 0, err
 	}
-	fmt.Println(ipset)
-	return 1, nil
-}
+	var totalBytes float64
+	for _, pod := range pods {
+		Bytes, _ := readFromPod(clientset, &pod, cmd)
+		totalBytes += Bytes
+	}
 
-//==============================---Get-Service-Bytes-Transmitted---============================
-
-func getServiceBytesTransmitted(clientset kubernetes.Interface, service *corev1.Service) (float64, error) {
-
-	return 1, nil
+	return totalBytes, nil
 }
 
 //===============================---utils---=================================
@@ -257,4 +262,58 @@ func getPodsbyService(clientset kubernetes.Interface, service *corev1.Service) (
 	}
 
 	return podLists, nil
+}
+
+func readFromPod(clientset kubernetes.Interface, pod *corev1.Pod, cmd string) (float64, error) {
+
+	// Load the Kubernetes configuration file
+	path := os.Getenv("HOME") + "/.kube/config"
+	config, err := clientcmd.BuildConfigFromFlags("", path)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	podName := pod.Name
+	namespace := pod.Namespace
+	var totalBytes float64
+	for _, container := range pod.Spec.Containers {
+		containerName := container.Name
+		// Create a stream to the container
+		req := clientset.CoreV1().RESTClient().Post().
+			Resource("pods").
+			Name(podName).
+			Namespace(namespace).
+			SubResource("exec").
+			Param("container", containerName)
+
+		req.VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   []string{"sh", "-c", cmd},
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+		exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+		if err != nil {
+			fmt.Printf("Error creating executor: %s\n", err)
+			return 0, err
+		}
+
+		output := bytes.NewBuffer(nil)
+
+		// Create a stream to the container
+		err = exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+			Stdout: output,
+			Stderr: os.Stderr,
+			Tty:    false,
+		})
+		if err != nil {
+			fmt.Printf("Error streaming: %s\n", err)
+			return 0, err
+		}
+		r, _ := strconv.ParseFloat(output.String(), 64)
+		totalBytes += r
+	}
+
+	return totalBytes, nil
 }
